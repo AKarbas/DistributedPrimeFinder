@@ -124,6 +124,12 @@ class MasterActor(config: Config) extends Actor {
 object MasterActor {
   def props(config: Config): Props = Props(new MasterActor(config))
 
+  final case class chunkRequest(idx: BigInt)
+
+  final case class saveChunk(bm: RoaringBitmap, idx: BigInt)
+
+  case object jobRequest
+
   val chunkPrefix: String = "chunk"
   val checkpointFileName: String = "checkpoint.bin"
   val chunkLen: Int = 1 << 26
