@@ -2,20 +2,36 @@ package com.oitsmak.primer
 package master
 
 import java.io._
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedDeque}
 
+import scala.collection.concurrent
+import scala.concurrent.duration._
+import collection.JavaConverters._
 import akka.actor._
 import akka.event.Logging
+import akka.pattern.ask
+import akka.util.Timeout
 import com.typesafe.config.{Config, ConfigFactory}
 import org.roaringbitmap.RoaringBitmap
-import org.roaringbitmap.buffer.ImmutableRoaringBitmap
+
+import scala.concurrent.{Await, Future}
 
 /**
   * Remote actor which listens on port 5150
   */
 class MasterActor(config: Config) extends Actor {
+
+  import MasterActor._
+  import worker.WorkerActor._
+
   val storageDir: File = checkDir(config.getString("primer.storageDir"))
   val log = Logging(context.system, this)
   var checkpoint: BigInt = 0
+  val jobQueue = new ConcurrentLinkedDeque[BigInt]()
+  val workers: concurrent.Map[ActorRef, BigInt] =
+    new ConcurrentHashMap[ActorRef, BigInt]().asScala
+  var assigned: Set[BigInt] = Set[BigInt]()
+
 
   def checkDir(path: String): File = {
     val dir = new File(path)
@@ -31,6 +47,10 @@ class MasterActor(config: Config) extends Actor {
     if (checkNotExists)
       require(!file.exists())
     file
+  }
+
+  def chunkDone(idx: BigInt): Boolean = {
+    new File(storageDir, chunkPrefix + idx.toString).exists()
   }
 
   def rmIfExists(name: String): File = {
@@ -74,7 +94,7 @@ class MasterActor(config: Config) extends Actor {
 
   def checkCheckpointFile(): Unit = {
     try {
-      val file: File = getFile(MasterActor.checkpointFileName, checkExists = true)
+      val file: File = getFile(checkpointFileName, checkExists = true)
       val ois = new ObjectInputStream(new FileInputStream(file))
       checkpoint = ois.readObject().asInstanceOf[BigInt]
     } catch {
@@ -84,13 +104,13 @@ class MasterActor(config: Config) extends Actor {
   }
 
   def saveCheckpointFile(checkPoint: BigInt): Unit = {
-    val file: File = getFile(MasterActor.checkpointFileName + ".TEMP", checkNotExists = true)
+    val file: File = getFile(checkpointFileName + ".TEMP", checkNotExists = true)
     val fos = new FileOutputStream(file)
     val oos = new ObjectOutputStream(fos)
     oos.writeObject(checkPoint)
     fos.close()
-    getFile(MasterActor.checkpointFileName, checkNotExists = true)
-    file.renameTo(getFile(MasterActor.checkpointFileName))
+    getFile(checkpointFileName, checkNotExists = true)
+    file.renameTo(getFile(checkpointFileName))
     this.checkpoint = checkPoint
   }
 
@@ -112,23 +132,73 @@ class MasterActor(config: Config) extends Actor {
     ret
   }
 
-  override def receive: Receive = {
-    case msg: String => {
-      println("Message received " + msg + " from " + sender)
-      sender ! "hi"
+  def updateJobQueue(idx: BigInt = 0): Unit = {
+    if (idx != 0) {
+      jobQueue.remove(idx)
     }
-    case _ => println("Received unknown msg ")
+    var addable = checkpoint
+    while (jobQueue.size() < 1.5 * workers.size) {
+      if (!chunkDone(addable)
+        && assigned.contains(addable)
+        && !isOngoing(addable))
+        jobQueue.add(addable)
+      addable += 1
+    }
+  }
+
+  def isOngoing(idx: BigInt): Boolean = {
+    workers.foreach(w => {
+      if (w._2 == idx && isOk(w._1))
+        return true
+    })
+    false
+  }
+
+  def isOk(ref: ActorRef): Boolean = {
+    implicit val timeout: Timeout = Timeout(3 seconds)
+    Await.result(ref ? AskOk, 3 seconds).asInstanceOf[IsOk].is
+  }
+
+  override def receive: Receive = {
+    case Connect =>
+      workers += ((sender, null))
+      updateJobQueue()
+    case JobRequest => {
+      if (jobQueue.isEmpty) updateJobQueue() // just to be safe
+      val nextJob = JobDef(jobQueue.removeFirst(), chunkLen)
+      sender ! nextJob
+      assigned += nextJob.idx
+      updateJobQueue()
+    }
+    case GetChunk(idx) =>
+      try {
+        val bm = getChunk(idx)
+        sender() ! GiveChunk(bm, idx)
+      } catch {
+        case e: Exception => sender() ! akka.actor.Status.Failure(e)
+      }
+    case PutChunk(bm, idx) => {
+      saveChunk(bm, idx)
+      assigned -= idx
+      workers += ((sender, null))
+      updateJobQueue(idx)
+    }
+    case _ => println("Received unknown msg!")
   }
 }
 
 object MasterActor {
   def props(config: Config): Props = Props(new MasterActor(config))
 
-  final case class chunkRequest(idx: BigInt)
+  final case class GetChunk(idx: BigInt)
 
-  final case class saveChunk(bm: RoaringBitmap, idx: BigInt)
+  final case class PutChunk(bm: RoaringBitmap, idx: BigInt)
 
-  case object jobRequest
+  final case class IsOk(is: Boolean)
+
+  case object JobRequest
+
+  case object Connect
 
   val chunkPrefix: String = "chunk"
   val checkpointFileName: String = "checkpoint.bin"

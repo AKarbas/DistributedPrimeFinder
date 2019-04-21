@@ -2,4 +2,6 @@
 *.log
 .DS_STORE
 .idea
-
+src/main/scala/Test.scala
+target
+project
